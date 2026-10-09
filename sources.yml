@@ -1,0 +1,32 @@
+# Registry of raw data sources. Each entry becomes one file in data/raw/.
+
+sources:
+  - name: voteview_members
+    url: https://voteview.com/static/data/out/members/HSall_members.csv
+    filename: voteview_members.csv
+    notes: >
+      Voteview member ideology (DW-NOMINATE), House and Senate, 1789 to present.
+      Cite: Lewis, Poole, Rosenthal, Boche, Rudkin and Sonnet (2026),
+      Voteview: Congressional Roll-Call Votes Database, https://voteview.com/
+
+  - name: voteview_rollcalls
+    url: https://voteview.com/static/data/out/rollcalls/HSall_rollcalls.csv
+    filename: voteview_rollcalls.csv
+    notes: Voteview roll calls, one row per recorded vote.
+
+  - name: voteview_votes
+    url: https://voteview.com/static/data/out/votes/HSall_votes.csv
+    filename: voteview_votes.csv
+    notes: Voteview member votes. Large file (about 700 MB).
+
+  - name: legislators_historical
+    url: https://unitedstates.github.io/congress-legislators/legislators-historical.csv
+    filename: legislators_historical.csv
+    notes: >
+      congress-legislators, former members. Union with the current file and
+      de-duplicate, as the split between the two is somewhat arbitrary.
+
+  - name: legislators_current
+    url: https://unitedstates.github.io/congress-legislators/legislators-current.csv
+    filename: legislators_current.csv
+    notes: congress-legislators, currently serving members.
