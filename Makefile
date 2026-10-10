@@ -12,11 +12,11 @@ lint:  ## Check code style
 test:  ## Run the Python tests
 	pytest
 
-download:  ## Download raw source files (not built yet)
-	@echo "download: not built yet"
+download:  ## Download raw source files
+	python -m warehouse.ingest.download
 
-load:  ## Load raw files into DuckDB (not built yet)
-	@echo "load: not built yet"
+load:  ## Load raw files into DuckDB and Parquet
+	python -m warehouse.load
 
 transform:  ## Build the dbt models (not built yet)
 	@echo "transform: not built yet"
