@@ -19,6 +19,14 @@ sources:
     filename: voteview_votes.csv
     notes: Voteview member votes. Large file (about 700 MB).
 
+  - name: voteview_parties
+    url: https://voteview.com/static/data/out/parties/HSall_parties.csv
+    filename: voteview_parties.csv
+    notes: >
+      Voteview party codes and names, with party medians and means of the
+      DW-NOMINATE scores per Congress and chamber. Source of truth for the
+      party code to name mapping, and a cross-check for our polarisation figures.
+
   - name: legislators_historical
     url: https://unitedstates.github.io/congress-legislators/legislators-historical.csv
     filename: legislators_historical.csv
