@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -22,10 +23,10 @@ import httpx
 import yaml
 
 USER_AGENT = "congress-warehouse/0.1 (personal data engineering project)"
+DATAVERSE_BASE = "https://dataverse.harvard.edu"
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
 REPORT_EVERY = 100 * 1024 * 1024  # print progress every 100 MiB
 MAX_ATTEMPTS = 3
-REQUIRED_KEYS = ("name", "url", "filename")
 
 DEFAULT_REGISTRY = Path("sources.yml")
 DEFAULT_DEST = Path("data/raw")
@@ -35,11 +36,72 @@ MANIFEST_NAME = "manifest.json"
 @dataclass(frozen=True)
 class Source:
     name: str
+    filename: str
+    url: str | None = None
+    doi: str | None = None
+    file_pattern: str | None = None
+    manual_page: str | None = None
+    instructions: str | None = None
+
+
+class ManualDownloadRequired(Exception):
+    """A source must be downloaded by hand and the file is not in place yet."""
+
+
+@dataclass(frozen=True)
+class ResolvedFile:
+    """A Dataverse file that has been located through the dataset's file list."""
+
     url: str
     filename: str
+    file_id: int
+    dataset_version: str
 
 
 # ── registry ──────────────────────────────────────────────────
+
+
+def _parse_source(path: Path, position: int, entry: object) -> Source:
+    if not isinstance(entry, dict):
+        raise TypeError(f"{path}: source #{position} is not a mapping")
+
+    where = f"{path}: source #{position}"
+    missing = [key for key in ("name", "filename") if not entry.get(key)]
+    if missing:
+        raise ValueError(f"{where} is missing {', '.join(missing)}")
+
+    url, doi, pattern = entry.get("url"), entry.get("doi"), entry.get("file_pattern")
+    manual_page = entry.get("manual_page")
+    kinds = [
+        kind for kind, value in (("url", url), ("doi", doi), ("manual_page", manual_page)) if value
+    ]
+    if len(kinds) > 1:
+        raise ValueError(f"{where} must have only one of 'url', 'doi' or 'manual_page'")
+    if not kinds:
+        raise ValueError(f"{where} needs one of 'url', 'doi' or 'manual_page'")
+    if doi and not pattern:
+        raise ValueError(f"{where} has a 'doi' but no 'file_pattern'")
+    if pattern:
+        if not doi:
+            raise ValueError(f"{where} has a 'file_pattern' but no 'doi'")
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            raise ValueError(f"{where} has an invalid file_pattern: {error}") from error
+
+    filename = entry["filename"]
+    if Path(filename).name != filename:
+        raise ValueError(f"{where}: filename '{filename}' must not contain a path")
+
+    return Source(
+        name=entry["name"],
+        filename=filename,
+        url=url,
+        doi=doi,
+        file_pattern=pattern,
+        manual_page=manual_page,
+        instructions=entry.get("instructions"),
+    )
 
 
 def load_registry(path: Path) -> list[Source]:
@@ -55,23 +117,14 @@ def load_registry(path: Path) -> list[Source]:
     filenames: set[str] = set()
 
     for position, entry in enumerate(data["sources"], start=1):
-        if not isinstance(entry, dict):
-            raise TypeError(f"{path}: source #{position} is not a mapping")
-        missing = [key for key in REQUIRED_KEYS if not entry.get(key)]
-        if missing:
-            raise ValueError(f"{path}: source #{position} is missing {', '.join(missing)}")
-
-        name, url, filename = entry["name"], entry["url"], entry["filename"]
-        if Path(filename).name != filename:
-            raise ValueError(f"{path}: filename '{filename}' must not contain a path")
-        if name in names:
-            raise ValueError(f"{path}: duplicate source name '{name}'")
-        if filename in filenames:
-            raise ValueError(f"{path}: duplicate filename '{filename}'")
-
-        names.add(name)
-        filenames.add(filename)
-        sources.append(Source(name=name, url=url, filename=filename))
+        source = _parse_source(path, position, entry)
+        if source.name in names:
+            raise ValueError(f"{path}: duplicate source name '{source.name}'")
+        if source.filename in filenames:
+            raise ValueError(f"{path}: duplicate filename '{source.filename}'")
+        names.add(source.name)
+        filenames.add(source.filename)
+        sources.append(source)
 
     return sources
 
@@ -101,12 +154,93 @@ def write_manifest(path: Path, manifest: dict[str, dict]) -> None:
     os.replace(temporary, path)
 
 
+# ── Dataverse ─────────────────────────────────────────────────
+
+
+def resolve_dataverse(client: httpx.Client, source: Source) -> ResolvedFile:
+    """Find the one file in a Dataverse dataset that matches the source's pattern."""
+    doi, file_pattern = source.doi, source.file_pattern
+    if doi is None or file_pattern is None:
+        raise ValueError(f"{source.name}: not a Dataverse source")
+
+    api_url = f"{DATAVERSE_BASE}/api/datasets/:persistentId/?persistentId=doi:{doi}"
+    response = client.get(api_url)
+    response.raise_for_status()
+
+    try:
+        version = response.json()["data"]["latestVersion"]
+        files = [entry["dataFile"] for entry in version["files"]]
+        dataset_version = f"{version['versionNumber']}.{version['versionMinorNumber']}"
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{source.name}: unexpected response from Dataverse for doi:{doi}"
+        ) from error
+
+    pattern = re.compile(file_pattern)
+    matches = [item for item in files if pattern.search(item["filename"])]
+    if len(matches) != 1:
+        available = ", ".join(item["filename"] for item in files)
+        raise ValueError(
+            f"{source.name}: expected exactly one file matching '{file_pattern}' "
+            f"in doi:{doi}, found {len(matches)} (files: {available})"
+        )
+
+    chosen = matches[0]
+    url = f"{DATAVERSE_BASE}/api/access/datafile/{chosen['id']}"
+    if chosen.get("originalFileFormat"):
+        # Dataverse converts uploaded tables to its own tab-delimited format;
+        # this asks for the file as originally uploaded.
+        url += "?format=original"
+
+    return ResolvedFile(
+        url=url,
+        filename=chosen["filename"],
+        file_id=chosen["id"],
+        dataset_version=dataset_version,
+    )
+
+
 # ── downloading ───────────────────────────────────────────────
 
 
 def is_up_to_date(target: Path, entry: dict | None) -> bool:
     """True if the file exists and its size matches what the manifest recorded."""
     return entry is not None and target.exists() and target.stat().st_size == entry["bytes"]
+
+
+def register_manual(source: Source, target: Path, manifest: dict[str, dict]) -> bool:
+    """Record a hand-downloaded file in the manifest, or explain how to get it."""
+    if not target.exists():
+        message = [
+            f"expected the file at {target}",
+            f"  download it by hand from {source.manual_page}",
+        ]
+        if source.instructions:
+            message.append("  " + " ".join(source.instructions.split()))
+        raise ManualDownloadRequired("\n".join(message))
+
+    digest = hashlib.sha256()
+    total_bytes = 0
+    line_count = 0
+    with target.open("rb") as handle:
+        while chunk := handle.read(CHUNK_SIZE):
+            digest.update(chunk)
+            total_bytes += len(chunk)
+            line_count += chunk.count(b"\n")
+    if total_bytes == 0:
+        raise ValueError(f"{target} is empty")
+
+    manifest[source.name] = {
+        "manual": True,
+        "source_page": source.manual_page,
+        "filename": source.filename,
+        "registered_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "bytes": total_bytes,
+        "sha256": digest.hexdigest(),
+        "lines": line_count,
+    }
+    print(f"register  {source.name}: {total_bytes / 1024 / 1024:,.1f} MB (downloaded by hand)")
+    return True
 
 
 def download_one(
@@ -127,7 +261,15 @@ def download_one(
         print(f"skip      {source.name} (already downloaded)")
         return False
 
+    if source.manual_page is not None:
+        return register_manual(source, target, manifest)
+
     print(f"download  {source.name}")
+    resolved = resolve_dataverse(client, source) if source.doi else None
+    download_url = resolved.url if resolved else source.url
+    if download_url is None:
+        raise ValueError(f"{source.name}: no download URL")
+
     part = target.with_name(target.name + ".part")
     digest = hashlib.sha256()
     total_bytes = 0
@@ -136,7 +278,7 @@ def download_one(
     started = time.monotonic()
 
     try:
-        with client.stream("GET", source.url) as response:
+        with client.stream("GET", download_url) as response:
             response.raise_for_status()
             with part.open("wb") as handle:
                 for chunk in response.iter_bytes(CHUNK_SIZE):
@@ -162,14 +304,25 @@ def download_one(
 
     os.replace(part, target)
 
-    manifest[source.name] = {
-        "url": source.url,
+    entry: dict = {
+        "url": download_url,
         "filename": source.filename,
         "downloaded_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "bytes": total_bytes,
         "sha256": digest.hexdigest(),
         "lines": line_count,
     }
+    if resolved is not None:
+        entry.update(
+            {
+                "doi": source.doi,
+                "dataset_version": resolved.dataset_version,
+                "source_file_id": resolved.file_id,
+                "source_filename": resolved.filename,
+            }
+        )
+    manifest[source.name] = entry
+
     elapsed = time.monotonic() - started
     print(f"done      {source.name}: {total_bytes / 1024 / 1024:,.1f} MB in {elapsed:,.1f}s")
     return True
@@ -241,7 +394,13 @@ def run(
             try:
                 if download_with_retries(client, source, dest_dir, manifest, force):
                     write_manifest(manifest_path, manifest)  # save progress after each file
-            except (httpx.HTTPError, RuntimeError, OSError) as error:
+            except (
+                httpx.HTTPError,
+                RuntimeError,
+                OSError,
+                ValueError,
+                ManualDownloadRequired,
+            ) as error:
                 print(f"FAILED    {source.name}: {error}", file=sys.stderr)
                 failures.append(source.name)
     finally:

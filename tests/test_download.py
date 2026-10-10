@@ -241,3 +241,287 @@ def test_main_reports_a_missing_registry_cleanly(tmp_path, capsys):
     )
     assert code == 2
     assert "error:" in capsys.readouterr().err
+
+
+# ── Dataverse sources ─────────────────────────────────────────
+
+DOI = "10.7910/DVN/EXAMPLE"
+HOUSE_PATTERN = r"^\d{4}-\d{4}-house\."
+
+
+def dataverse_payload(files, version=(15, 0)):
+    return {
+        "status": "OK",
+        "data": {
+            "latestVersion": {
+                "versionNumber": version[0],
+                "versionMinorNumber": version[1],
+                "files": [{"dataFile": item} for item in files],
+            }
+        },
+    }
+
+
+TABULAR_FILES = [
+    {"id": 11, "filename": "1976-2024-house.tab", "originalFileFormat": "text/csv"},
+    {"id": 12, "filename": "codebook-us-house.md"},
+    {"id": 13, "filename": "sources-house.tab", "originalFileFormat": "text/csv"},
+]
+
+
+def dataverse_handler(files, requests_seen=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requests_seen is not None:
+            requests_seen.append(str(request.url))
+        if "/api/datasets/" in request.url.path:
+            return httpx.Response(200, json=dataverse_payload(files))
+        return httpx.Response(200, content=CONTENT)
+
+    return handler
+
+
+@pytest.fixture
+def dataverse_source() -> Source:
+    return Source(name="house", filename="house.csv", doi=DOI, file_pattern=HOUSE_PATTERN)
+
+
+def test_registry_accepts_a_dataverse_source(tmp_path):
+    registry = write_registry(
+        tmp_path / "sources.yml",
+        "sources:\n"
+        "  - name: house\n"
+        f"    doi: {DOI}\n"
+        f"    file_pattern: '{HOUSE_PATTERN}'\n"
+        "    filename: house.csv\n",
+    )
+    (source,) = download.load_registry(registry)
+    assert source.doi == DOI
+    assert source.file_pattern == HOUSE_PATTERN
+    assert source.url is None
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ("    url: https://x.test/a.csv\n    doi: 10.1/x\n    file_pattern: a\n", "only one of"),
+        ("", "needs one of"),
+        ("    doi: 10.1/x\n", "no 'file_pattern'"),
+        ("    url: https://x.test/a.csv\n    file_pattern: a\n", "no 'doi'"),
+        ("    doi: 10.1/x\n    file_pattern: '['\n", "invalid file_pattern"),
+    ],
+)
+def test_registry_rejects_bad_source_combinations(tmp_path, fields, message):
+    registry = write_registry(
+        tmp_path / "sources.yml", f"sources:\n  - name: a\n    filename: a.csv\n{fields}"
+    )
+    with pytest.raises(ValueError, match=message):
+        download.load_registry(registry)
+
+
+def test_dataverse_download_picks_the_matching_file_as_original_csv(tmp_path, dataverse_source):
+    seen: list[str] = []
+    manifest: dict = {}
+    with make_client(dataverse_handler(TABULAR_FILES, seen)) as client:
+        downloaded = download.download_one(client, dataverse_source, tmp_path, manifest)
+
+    assert downloaded is True
+    assert (tmp_path / "house.csv").read_bytes() == CONTENT
+    assert seen[-1].endswith("/api/access/datafile/11?format=original")
+    entry = manifest["house"]
+    assert entry["doi"] == DOI
+    assert entry["dataset_version"] == "15.0"
+    assert entry["source_file_id"] == 11
+    assert entry["source_filename"] == "1976-2024-house.tab"
+
+
+def test_dataverse_plain_files_are_downloaded_without_the_original_option(
+    tmp_path, dataverse_source
+):
+    files = [{"id": 21, "filename": "1976-2024-house.csv"}]  # not converted by Dataverse
+    seen: list[str] = []
+    with make_client(dataverse_handler(files, seen)) as client:
+        download.download_one(client, dataverse_source, tmp_path, {})
+    assert seen[-1].endswith("/api/access/datafile/21")
+
+
+def test_dataverse_no_matching_file_is_an_error(tmp_path, dataverse_source):
+    files = [{"id": 12, "filename": "codebook-us-house.md"}]
+    with (
+        make_client(dataverse_handler(files)) as client,
+        pytest.raises(ValueError, match="found 0"),
+    ):
+        download.download_one(client, dataverse_source, tmp_path, {})
+    assert not (tmp_path / "house.csv").exists()
+
+
+def test_dataverse_several_matching_files_is_an_error(tmp_path, dataverse_source):
+    files = [
+        {"id": 1, "filename": "1976-2022-house.tab"},
+        {"id": 2, "filename": "1976-2024-house.tab"},
+    ]
+    with (
+        make_client(dataverse_handler(files)) as client,
+        pytest.raises(ValueError, match="found 2"),
+    ):
+        download.download_one(client, dataverse_source, tmp_path, {})
+
+
+def test_dataverse_unexpected_response_is_an_error(tmp_path, dataverse_source):
+    def handler(request):
+        return httpx.Response(200, json={"status": "ERROR", "message": "nope"})
+
+    with make_client(handler) as client, pytest.raises(ValueError, match="unexpected response"):
+        download.download_one(client, dataverse_source, tmp_path, {})
+
+
+def test_dataverse_skip_makes_no_requests(tmp_path, dataverse_source):
+    seen: list[str] = []
+    manifest: dict = {}
+    with make_client(dataverse_handler(TABULAR_FILES, seen)) as client:
+        download.download_one(client, dataverse_source, tmp_path, manifest)
+        before = len(seen)
+        skipped = download.download_one(client, dataverse_source, tmp_path, manifest)
+    assert skipped is False
+    assert len(seen) == before
+
+
+def test_run_continues_after_a_dataverse_resolution_failure(tmp_path):
+    registry = write_registry(
+        tmp_path / "sources.yml",
+        "sources:\n"
+        "  - name: house\n"
+        f"    doi: {DOI}\n"
+        f"    file_pattern: '{HOUSE_PATTERN}'\n"
+        "    filename: house.csv\n"
+        "  - name: plain\n    url: https://x.test/plain.csv\n    filename: plain.csv\n",
+    )
+    dest = tmp_path / "raw"
+    # No matching file in the dataset, so "house" fails but "plain" must still download.
+    with make_client(dataverse_handler([{"id": 12, "filename": "codebook.md"}])) as client:
+        code = download.run(registry, dest, client=client)
+
+    assert code == 1
+    assert (dest / "plain.csv").exists()
+    assert not (dest / "house.csv").exists()
+
+
+# ── manual sources ────────────────────────────────────────────
+
+MANUAL_PAGE = "https://doi.org/10.1234/example"
+
+
+@pytest.fixture
+def manual_source() -> Source:
+    return Source(
+        name="manual",
+        filename="manual.tsv",
+        manual_page=MANUAL_PAGE,
+        instructions="Fill in the form,\n  then save the file.",
+    )
+
+
+def test_registry_accepts_a_manual_source(tmp_path):
+    registry = write_registry(
+        tmp_path / "sources.yml",
+        "sources:\n"
+        "  - name: manual\n"
+        f"    manual_page: {MANUAL_PAGE}\n"
+        "    filename: manual.tsv\n"
+        "    instructions: Save it by hand.\n",
+    )
+    (source,) = download.load_registry(registry)
+    assert source.manual_page == MANUAL_PAGE
+    assert source.instructions == "Save it by hand."
+    assert source.url is None
+
+
+def test_registry_rejects_manual_page_combined_with_url(tmp_path):
+    registry = write_registry(
+        tmp_path / "sources.yml",
+        "sources:\n  - name: a\n    filename: a.csv\n"
+        f"    url: https://x.test/a.csv\n    manual_page: {MANUAL_PAGE}\n",
+    )
+    with pytest.raises(ValueError, match="only one of"):
+        download.load_registry(registry)
+
+
+def test_manual_file_missing_explains_how_to_get_it(tmp_path, manual_source):
+    manifest: dict = {}
+    with (
+        make_client(ok_handler) as client,
+        pytest.raises(download.ManualDownloadRequired) as caught,
+    ):
+        download.download_one(client, manual_source, tmp_path, manifest)
+
+    message = str(caught.value)
+    assert str(tmp_path / "manual.tsv") in message
+    assert MANUAL_PAGE in message
+    assert "Fill in the form, then save the file." in message  # whitespace tidied
+    assert manifest == {}
+
+
+def test_manual_file_is_registered_in_the_manifest(tmp_path, manual_source):
+    (tmp_path / "manual.tsv").write_bytes(CONTENT)
+    manifest: dict = {}
+    calls: list[httpx.Request] = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200)
+
+    with make_client(handler) as client:
+        registered = download.download_one(client, manual_source, tmp_path, manifest)
+
+    assert registered is True
+    assert calls == []  # never touches the network
+    entry = manifest["manual"]
+    assert entry["manual"] is True
+    assert entry["source_page"] == MANUAL_PAGE
+    assert entry["bytes"] == len(CONTENT)
+    assert entry["sha256"] == hashlib.sha256(CONTENT).hexdigest()
+    assert entry["lines"] == 3
+
+
+def test_manual_file_already_registered_is_skipped(tmp_path, manual_source):
+    (tmp_path / "manual.tsv").write_bytes(CONTENT)
+    manifest: dict = {}
+    with make_client(ok_handler) as client:
+        download.download_one(client, manual_source, tmp_path, manifest)
+        again = download.download_one(client, manual_source, tmp_path, manifest)
+    assert again is False
+
+
+def test_manual_file_that_changed_is_registered_again(tmp_path, manual_source):
+    target = tmp_path / "manual.tsv"
+    target.write_bytes(CONTENT)
+    manifest: dict = {}
+    with make_client(ok_handler) as client:
+        download.download_one(client, manual_source, tmp_path, manifest)
+        target.write_bytes(CONTENT + b"3,gamma\n")
+        again = download.download_one(client, manual_source, tmp_path, manifest)
+    assert again is True
+    assert manifest["manual"]["lines"] == 4
+
+
+def test_empty_manual_file_is_rejected(tmp_path, manual_source):
+    (tmp_path / "manual.tsv").write_bytes(b"")
+    with make_client(ok_handler) as client, pytest.raises(ValueError, match="is empty"):
+        download.download_one(client, manual_source, tmp_path, {})
+
+
+def test_run_reports_a_missing_manual_file_but_downloads_the_rest(tmp_path, capsys):
+    registry = write_registry(
+        tmp_path / "sources.yml",
+        "sources:\n"
+        "  - name: manual\n"
+        f"    manual_page: {MANUAL_PAGE}\n"
+        "    filename: manual.tsv\n"
+        "  - name: plain\n    url: https://x.test/plain.csv\n    filename: plain.csv\n",
+    )
+    dest = tmp_path / "raw"
+    with make_client(ok_handler) as client:
+        code = download.run(registry, dest, client=client)
+
+    assert code == 1
+    assert (dest / "plain.csv").exists()
+    assert MANUAL_PAGE in capsys.readouterr().err
